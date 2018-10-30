@@ -16,7 +16,6 @@ import org.jetbrains.kotlin.backend.konan.descriptors.needsInlining
 import org.jetbrains.kotlin.backend.konan.descriptors.propertyIfAccessor
 import org.jetbrains.kotlin.backend.konan.descriptors.resolveFakeOverride
 import org.jetbrains.kotlin.backend.konan.ir.DeserializerDriver
-import org.jetbrains.kotlin.backend.konan.ir.ir2stringWholezzz
 import org.jetbrains.kotlin.config.languageVersionSettings
 import org.jetbrains.kotlin.descriptors.*
 import org.jetbrains.kotlin.ir.IrElement
@@ -30,12 +29,10 @@ import org.jetbrains.kotlin.ir.expressions.impl.IrReturnableBlockImpl
 import org.jetbrains.kotlin.ir.expressions.impl.IrVarargImpl
 import org.jetbrains.kotlin.ir.symbols.IrClassSymbol
 import org.jetbrains.kotlin.ir.symbols.impl.IrReturnableBlockSymbolImpl
-import org.jetbrains.kotlin.ir.types.IrType
 import org.jetbrains.kotlin.ir.types.classifierOrNull
 import org.jetbrains.kotlin.ir.types.toKotlinType
 import org.jetbrains.kotlin.ir.util.getArguments
 import org.jetbrains.kotlin.ir.util.parentAsClass
-import org.jetbrains.kotlin.ir.util.patchDeclarationParents
 import org.jetbrains.kotlin.ir.visitors.*
 import org.jetbrains.kotlin.name.FqName
 import org.jetbrains.kotlin.resolve.descriptorUtil.fqNameSafe
@@ -160,22 +157,22 @@ internal class FunctionInlining(val context: Context): IrElementTransformerWithC
     override fun visitCall(expression: IrCall, data: Ref<Boolean>): IrExpression {
 
         val argsAreBad = Ref(false)
-        val irCall = super.visitCall(expression, argsAreBad) as IrCall
+        val callSite = super.visitCall(expression, argsAreBad) as IrCall
         data.value = data.value or argsAreBad.value
-        if (!irCall.descriptor.needsInlining)
-            return irCall
-        val functionDescriptor = irCall.descriptor.resolveFakeOverride().original
+        if (!callSite.descriptor.needsInlining)
+            return callSite
+        val functionDescriptor = callSite.descriptor.resolveFakeOverride().original
         if (functionDescriptor == context.ir.symbols.isInitializedGetterDescriptor)
-            return irCall
+            return callSite
 
-        val functionDeclaration = getFunctionDeclaration(functionDescriptor)
-        if (functionDeclaration == null) {
+        val callee = getFunctionDeclaration(functionDescriptor)
+        if (callee == null) {
             val message = "Inliner failed to obtain function declaration: " +
                           functionDescriptor.fqNameSafe.toString()
-            context.reportWarning(message, currentFile, irCall)
-            return irCall
+            context.reportWarning(message, currentFile, callSite)
+            return callSite
         }
-        data.value = data.value or functionDeclaration.second
+        data.value = data.value or callee.second
 
         val childIsBad = Ref(inlineFunctions[functionDescriptor] ?: false)
 
@@ -183,7 +180,7 @@ internal class FunctionInlining(val context: Context): IrElementTransformerWithC
 //        println("BEFORE RECURSIVE INLINE: ${ir2stringWholezzz(functionDeclaration.first)}")
 //        println()
 
-        functionDeclaration.first.transformChildren(this, childIsBad)                            // Process recursive inline.
+        callee.first.transformChildren(this, childIsBad)                            // Process recursive inline.
 
         inlineFunctions[functionDescriptor] = childIsBad.value
 
@@ -192,12 +189,11 @@ internal class FunctionInlining(val context: Context): IrElementTransformerWithC
 //        println()
 
         data.value = data.value or childIsBad.value
-        val currentCalleeIsBad = argsAreBad.value or childIsBad.value or functionDeclaration.second// or (context.ir.symbols.entryPoint == null)
+        val currentCalleeIsBad = argsAreBad.value or childIsBad.value or callee.second// or (context.ir.symbols.entryPoint == null)
         //val currentCalleeIsBad = true
-        val inliner = Inliner(globalSubstituteMap, functionDeclaration.first,
-                !currentCalleeIsBad, currentScope!!,
+        val inliner = Inliner(globalSubstituteMap, callSite, callee.first, !currentCalleeIsBad, currentScope!!,
                 allScopes.map { it.irElement }.filterIsInstance<IrDeclarationParent>().lastOrNull(), context, this)
-        return inliner.inline(irCall)
+        return inliner.inline()
     }
 
     //-------------------------------------------------------------------------//
@@ -225,29 +221,33 @@ private val FunctionDescriptor.isInlineConstructor get() = annotations.hasAnnota
 //-----------------------------------------------------------------------------//
 
 private class Inliner(val globalSubstituteMap: MutableMap<DeclarationDescriptor, SubstitutedDescriptor>,
-                      val functionDeclaration: IrFunction,                                  // Function to substitute.
+                      val callSite: IrCall,
+                      val callee: IrFunction,
                       val local: Boolean,
                       val currentScope: ScopeWithIr,
                       val parent: IrDeclarationParent?,
                       val context: Context,
                       val owner: FunctionInlining /*TODO: make inner*/) {
 
+    val typeArguments =
+            (if (callee is IrConstructor)
+                callee.parentAsClass.typeParameters
+            else callee.typeParameters).let { typeParameters ->
+                (0 until callSite.typeArgumentsCount).map {
+                    typeParameters[it].symbol to callSite.getTypeArgument(it)
+                }.associate { it }
+            }
+
     val copyIrElement =
             if (local)
-                DeepCopyIrTreeZzz(context, functionDeclaration.descriptor, parent)
+                DeepCopyIrTreeZzz(context, typeArguments, parent)
             else
-                DeepCopyIrTreeWithDescriptors(functionDeclaration.descriptor, currentScope.scope.scopeOwner, context) // Create DeepCopy for current scope.
-    //val copyIrElement = DeepCopyIrTreeZzz(context, functionDeclaration.descriptor)
+                DeepCopyIrTreeWithDescriptors(callee.descriptor, currentScope.scope.scopeOwner, context, createTypeSubstitutor(callSite))
+
     val substituteMap = mutableMapOf<ValueDescriptor, IrExpression>()
 
-    //-------------------------------------------------------------------------//
+    fun inline() = inlineFunction(callSite, callee)
 
-    fun inline(irCall: IrCall): IrReturnableBlockImpl {                                     // Call to be substituted.
-        val inlineFunctionBody = inlineFunction(irCall, functionDeclaration)
-        return inlineFunctionBody
-    }
-
-    //-------------------------------------------------------------------------//
     /**
      * TODO: JVM inliner crashed on attempt inline this function from transform.kt with:
      *  j.l.IllegalStateException: Couldn't obtain compiled function body for
@@ -259,30 +259,14 @@ private class Inliner(val globalSubstituteMap: MutableMap<DeclarationDescriptor,
           }
      }
 
-    private fun inlineFunction(callee: IrCall,                                             // Call to be substituted.
-                               caller: IrFunction): IrReturnableBlockImpl {                 // Function to substitute.
-
-//        if (callee.typeArgumentsCount != caller.typeParameters.size)
-//            println("BUGBUGBUG: ${ir2stringWholezzz(callee)}\n\n\n${ir2stringWholezzz(caller)}")
-
-        val typeParameters = if (caller is IrConstructor)
-            caller.parentAsClass.typeParameters
-        else caller.typeParameters
-
-        val typeArguments = (0 until callee.typeArgumentsCount).map {
-            typeParameters[it].symbol to callee.getTypeArgument(it)
-        }.associate { it }
+    private fun inlineFunction(callSite: IrCall,                                             // Call to be substituted.
+                               callee: IrFunction): IrReturnableBlockImpl {                 // Function to substitute.
 
 //        println()
-//        println("BEFORE COPYING: ${ir2stringWholezzz(caller)}")
+//        println("BEFORE COPYING: ${ir2stringWholezzz(callee)}")
 //        println()
 
-        val copyFunctionDeclaration =
-                (if (local)
-                    copyIrElement.copy(caller, typeArguments)
-                else
-                    copyIrElement.copy(caller, createTypeSubstitutor(callee))
-                        ) as IrFunction
+        val copyFunctionDeclaration = copyIrElement.copy(callee) as IrFunction
 
 //        println("AFTER COPYING: ${ir2stringWholezzz(copyFunctionDeclaration)}")
 //        println()
@@ -290,19 +274,19 @@ private class Inliner(val globalSubstituteMap: MutableMap<DeclarationDescriptor,
         val irReturnableBlockSymbol = IrReturnableBlockSymbolImpl(copyFunctionDeclaration.descriptor.original)
         //val irReturnableBlockSymbol = IrReturnableBlockSymbolImpl(copyFunctionDeclaration.descriptor)
 
-        val evaluationStatements = evaluateArguments(callee, copyFunctionDeclaration)       // And list of evaluation statements.
+        val evaluationStatements = evaluateArguments(callSite, copyFunctionDeclaration)       // And list of evaluation statements.
 
         val statements = (copyFunctionDeclaration.body as IrBlockBody).statements           // IR statements from function copy.
 
-        val startOffset = caller.startOffset
-        val endOffset = caller.endOffset
-        val descriptor = caller.descriptor.original
+        val startOffset = callee.startOffset
+        val endOffset = callee.endOffset
+        val descriptor = callee.descriptor.original
         if (descriptor.isInlineConstructor) {
             val delegatingConstructorCall = statements[0] as IrDelegatingConstructorCall
             val irBuilder = context.createIrBuilder(irReturnableBlockSymbol, startOffset, endOffset)
             irBuilder.run {
                 val constructorDescriptor = delegatingConstructorCall.descriptor.original
-                val constructorCall = irCall(delegatingConstructorCall.symbol, callee.type,
+                val constructorCall = irCall(delegatingConstructorCall.symbol, callSite.type,
                         constructorDescriptor.typeParameters.map { delegatingConstructorCall.getTypeArgument(it)!! }).apply {
                     constructorDescriptor.valueParameters.forEach { putValueArgument(it, delegatingConstructorCall.getValueArgument(it)) }
                 }
@@ -317,7 +301,7 @@ private class Inliner(val globalSubstituteMap: MutableMap<DeclarationDescriptor,
             }
         }
 
-        val sourceFileName = context.ir.originalModuleIndex.declarationToFile[caller.descriptor.original]?:""
+        val sourceFileName = context.ir.originalModuleIndex.declarationToFile[callee.descriptor.original]?:""
 
         // Update globalSubstituteMap before computing return type.
         // This is needed because of nested inlining.
@@ -331,7 +315,7 @@ private class Inliner(val globalSubstituteMap: MutableMap<DeclarationDescriptor,
         val returnType = substitutedDescriptor?.let { context.ir.translateErased((it.descriptor as ClassDescriptor).defaultType) }
                 ?: copyFunctionDeclaration.returnType
 
-        val isCoroutineIntrinsicCall = callee.descriptor.isBuiltInSuspendCoroutineUninterceptedOrReturn(context.config.configuration.languageVersionSettings)
+        val isCoroutineIntrinsicCall = callSite.descriptor.isBuiltInSuspendCoroutineUninterceptedOrReturn(context.config.configuration.languageVersionSettings)
 
         return IrReturnableBlockImpl(                                     // Create new IR element to replace "call".
             startOffset = startOffset,
@@ -365,17 +349,10 @@ private class Inliner(val globalSubstituteMap: MutableMap<DeclarationDescriptor,
             val descriptor = newExpression.descriptor
             val argument = substituteMap[descriptor]                                        // Find expression to replace this parameter.
 
-            //substituteMap.forEach { t, u -> println("QZZ: ${t.name} -> ${ir2stringWholezzz(u)}") }
-
             if (argument == null) return newExpression                                      // If there is no such expression - do nothing.
 
-            //println("QXX ${descriptor.name} : ${ir2stringWholezzz(argument)}")
-
             argument.transformChildrenVoid(this)                                            // Default argument can contain subjects for substitution.
-            return copyIrElement.copy(                                                      // Make copy of argument expression.
-                irElement       = argument,
-                typeSubstitutor = null
-            ) as IrExpression
+            return copyIrElement.copy(argument) as IrExpression
         }
 
         //-----------------------------------------------------------------//
